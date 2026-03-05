@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>QMK keyboard.json → keymap.json (mini éditeur)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 16px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    .panel { display: grid; grid-template-columns: 1fr; gap: 10px; margin-top: 12px; max-width: 1100px; }
+    #boardWrap { border: 1px solid #ccc; border-radius: 10px; padding: 12px; display: inline-block; background: #fafafa; }
+    #board { position: relative; }
+    .key {
+      position: absolute;
+      border: 1px solid #999;
+      border-radius: 8px;
+      background: #fff;
+      box-sizing: border-box;
+      cursor: pointer;
+      padding: 6px;
+      overflow: hidden;
+      display: flex;
+      align-items: flex-start;
+      justify-content: flex-start;
+      font-size: 12px;
+      line-height: 1.1;
+      user-select: none;
+    }
+    .key.selected { outline: 3px solid #2b6cb0; }
+    .key .idx { opacity: .55; margin-right: 6px; }
+    .key .kc { font-weight: 600; white-space: pre; }
+    .muted { opacity: .7; }
+    input[type="text"] { padding: 6px 8px; border-radius: 8px; border: 1px solid #bbb; min-width: 260px; }
+    select, button { padding: 6px 10px; border-radius: 8px; border: 1px solid #bbb; background: #fff; cursor: pointer; }
+    button.primary { background: #2b6cb0; color: #fff; border-color: #2b6cb0; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .hint { font-size: 12px; }
+    pre { background: #0b1020; color: #e8e8e8; padding: 10px; border-radius: 10px; overflow: auto; max-width: 1100px; }
+  </style>
+</head>
+<body>
+  <h2>Mini éditeur graphique QMK (keyboard.json → keymap.json)</h2>
+
+  <div class="row">
+    <input id="file" type="file" accept=".json,application/json" />
+    <input id="keymapFile" type="file" accept=".json,application/json" />
+    <span class="muted" id="kbMeta">Charge un keyboard.json…</span>
+  </div>
+
+  <div class="panel">
+    <div class="row">
+      <label>Layout :</label>
+      <select id="layoutSelect" disabled></select>
+
+      <label>Layer :</label>
+      <select id="layerSelect" disabled></select>
+      <button id="addLayer" disabled>+ Layer</button>
+      <button id="delLayer" disabled>- Layer</button>
+
+      <label>Taille :</label>
+      <select id="scaleSelect" disabled>
+        <option value="40">Petit</option>
+        <option value="55" selected>Moyen</option>
+        <option value="70">Grand</option>
+      </select>
+    </div>
+
+    <div class="row">
+      <span class="hint muted">Clique une touche → assigne un keycode (ex: <code>KC_A</code>, <code>MO(1)</code>, <code>LT(2, KC_SPC)</code>, …)</span>
+    </div>
+
+    <div class="row">
+      <label>Touche sélectionnée :</label>
+      <span id="selInfo" class="muted">aucune</span>
+      <input id="kcInput" type="text" placeholder="KC_TRNS / KC_NO / KC_A / MO(1) ..." disabled />
+      <button id="setKC" class="primary" disabled>Set</button>
+      <button id="clearKC" disabled>Clear</button>
+    </div>
+
+    <div id="boardWrap">
+      <div id="board"></div>
+    </div>
+
+    <div class="row">
+      <button id="exportBtn" class="primary" disabled>Export keymap.json</button>
+      <button id="copyBtn" disabled>Copier JSON</button>
+      <span class="muted hint">Puis: <code>qmk json2c keymap.json &gt; keymap.c</code></span>
+    </div>
+
+    <pre id="out" class="muted">Aperçu JSON…</pre>
+  </div>
+
+<script>
+(() => {
+  const fileEl = document.getElementById('file');
+  const kbMeta = document.getElementById('kbMeta');
+  const layoutSelect = document.getElementById('layoutSelect');
+  const layerSelect = document.getElementById('layerSelect');
+  const addLayerBtn = document.getElementById('addLayer');
+  const delLayerBtn = document.getElementById('delLayer');
+  const scaleSelect = document.getElementById('scaleSelect');
+  const board = document.getElementById('board');
+  const selInfo = document.getElementById('selInfo');
+  const kcInput = document.getElementById('kcInput');
+  const setKCBtn = document.getElementById('setKC');
+  const clearKCBtn = document.getElementById('clearKC');
+  const exportBtn = document.getElementById('exportBtn');
+  const copyBtn = document.getElementById('copyBtn');
+  const out = document.getElementById('out');
+
+  let keyboardJson = null;
+  let layoutName = null;
+  let layout = [];        // array of {x,y,w,h,label,...}
+  let selectedIndex = -1; // index in layout
+  let keymap = null;      // QMK configurator style object
+
+    const keymapFileEl = document.getElementById('keymapFile');
+
+keymapFileEl.addEventListener('change', async () => {
+  const f = keymapFileEl.files?.[0];
+  if (!f) return;
+
+  const text = await f.text();
+  const json = JSON.parse(text);
+
+  if (!json.layers) {
+    alert("Ce fichier ne contient pas de layers");
+    return;
+  }
+
+  if (json.layers[0].length !== layout.length) {
+    alert("Le keymap ne correspond pas au layout du clavier");
+    return;
+  }
+
+  keymap = json;
+
+  rebuildLayerSelect();
+  layerSelect.value = "0";
+
+  render();
+});
+
+  function guessKeyboardId(kb) {
+    // QMK Configurator expects something like "vendor/keyboard" sometimes.
+    // If your keyboard.json has "keyboard_name" only, we still put something.
+    // You can edit manually after export if needed.
+    return kb.keyboard_name || kb.keyboard || "custom_keyboard";
+  }
+
+  function getLayouts(kb) {
+    // QMK keyboard.json: { "layouts": { "LAYOUT": { "layout": [...] }, ... } }
+    if (!kb || !kb.layouts) return [];
+    return Object.keys(kb.layouts).filter(k => kb.layouts[k] && Array.isArray(kb.layouts[k].layout));
+  }
+
+  function ensureKeymapObj() {
+    if (keymap) return;
+    keymap = {
+      version: 1,
+      notes: "",
+      documentation: "",
+      keyboard: guessKeyboardId(keyboardJson),
+      keymap: "custom",
+      layout: layoutName,
+      layers: []
+    };
+    // default: 1 layer filled with KC_TRNS
+    keymap.layers.push(new Array(layout.length).fill("KC_TRNS"));
+  }
+
+  function rebuildLayerSelect() {
+    layerSelect.innerHTML = "";
+    keymap.layers.forEach((_, i) => {
+      const opt = document.createElement('option');
+      opt.value = String(i);
+      opt.textContent = `Layer ${i}`;
+      layerSelect.appendChild(opt);
+    });
+    layerSelect.disabled = false;
+    addLayerBtn.disabled = false;
+    delLayerBtn.disabled = keymap.layers.length <= 1;
+  }
+
+  function measureLayoutBounds() {
+    let maxX = 0, maxY = 0;
+    for (const k of layout) {
+      const x = k.x ?? 0, y = k.y ?? 0, w = k.w ?? 1, h = k.h ?? 1;
+      maxX = Math.max(maxX, x + w);
+      maxY = Math.max(maxY, y + h);
+    }
+    return { maxX, maxY };
+  }
+
+  function currentLayerIdx() {
+    return parseInt(layerSelect.value || "0", 10);
+  }
+
+  function keyLabel(i) {
+    const layerIdx = currentLayerIdx();
+    const kc = keymap.layers[layerIdx][i] || "KC_TRNS";
+    const shown = kc.length > 14 ? kc.slice(0, 14) + "…" : kc;
+    return shown;
+  }
+
+  function render() {
+    if (!keyboardJson || !layout.length) return;
+
+    ensureKeymapObj();
+
+    const unit = parseInt(scaleSelect.value, 10); // px per 1u
+    const { maxX, maxY } = measureLayoutBounds();
+    board.style.width = Math.ceil(maxX * unit) + "px";
+    board.style.height = Math.ceil(maxY * unit) + "px";
+
+    board.innerHTML = "";
+    layout.forEach((k, i) => {
+      const x = (k.x ?? 0) * unit;
+      const y = (k.y ?? 0) * unit;
+      const w = (k.w ?? 1) * unit;
+      const h = (k.h ?? 1) * unit;
+
+      const div = document.createElement('div');
+      div.className = "key" + (i === selectedIndex ? " selected" : "");
+      div.style.left = x + "px";
+      div.style.top = y + "px";
+      div.style.width = Math.ceil(w) + "px";
+      div.style.height = Math.ceil(h) + "px";
+
+      const idx = document.createElement('span');
+      idx.className = "idx";
+      idx.textContent = i;
+
+      const kc = document.createElement('div');
+      kc.className = "kc";
+      kc.textContent = keyLabel(i);
+
+      //div.appendChild(idx);
+
+        const sep = document.createElement('div');
+        sep.htmlContent = "<br>";
+
+        div.appendChild(sep);
+        div.appendChild(kc);
+
+      div.addEventListener('click', () => {
+        selectedIndex = i;
+        const layerIdx = currentLayerIdx();
+        const current = keymap.layers[layerIdx][i] || "KC_TRNS";
+        selInfo.textContent = `index ${i} (x=${k.x ?? 0}, y=${k.y ?? 0}, w=${k.w ?? 1}, h=${k.h ?? 1})`;
+        kcInput.disabled = false;
+        setKCBtn.disabled = false;
+        clearKCBtn.disabled = false;
+        kcInput.value = current;
+        render();
+        updatePreview();
+      });
+
+      board.appendChild(div);
+    });
+
+    exportBtn.disabled = false;
+    copyBtn.disabled = false;
+    scaleSelect.disabled = false;
+
+    updatePreview();
+  }
+
+  function updatePreview() {
+    if (!keymap) return;
+    out.textContent = JSON.stringify(keymap, null, 2);
+  }
+
+  function setLayout(name) {
+    layoutName = name;
+    layout = keyboardJson.layouts[name].layout;
+    selectedIndex = -1;
+
+    keymap = null; // reset keymap for new layout
+    ensureKeymapObj();
+    rebuildLayerSelect();
+
+    selInfo.textContent = "aucune";
+    kcInput.value = "";
+    kcInput.disabled = true;
+    setKCBtn.disabled = true;
+    clearKCBtn.disabled = true;
+
+    render();
+  }
+
+  fileEl.addEventListener('change', async () => {
+    const f = fileEl.files?.[0];
+    if (!f) return;
+
+    const text = await f.text();
+    keyboardJson = JSON.parse(text);
+
+    const layouts = getLayouts(keyboardJson);
+    if (!layouts.length) {
+      kbMeta.textContent = "Pas de layouts trouvés (keyboard.json doit contenir layouts -> <name> -> layout: [...]).";
+      return;
+    }
+
+    kbMeta.textContent = `${keyboardJson.keyboard_name || "Clavier"} — ${layouts.length} layout(s) détecté(s)`;
+    layoutSelect.disabled = false;
+    layoutSelect.innerHTML = "";
+    layouts.forEach(name => {
+      const opt = document.createElement('option');
+      opt.value = name;
+      opt.textContent = name;
+      layoutSelect.appendChild(opt);
+    });
+
+    // choisir le 1er layout par défaut
+    setLayout(layouts[0]);
+  });
+
+  layoutSelect.addEventListener('change', () => {
+    const name = layoutSelect.value;
+    setLayout(name);
+  });
+
+  layerSelect.addEventListener('change', () => {
+    // refresh key labels
+    selectedIndex = -1;
+    selInfo.textContent = "aucune";
+    kcInput.value = "";
+    kcInput.disabled = true;
+    setKCBtn.disabled = true;
+    clearKCBtn.disabled = true;
+    render();
+  });
+
+  addLayerBtn.addEventListener('click', () => {
+    ensureKeymapObj();
+    keymap.layers.push(new Array(layout.length).fill("KC_TRNS"));
+    rebuildLayerSelect();
+    layerSelect.value = String(keymap.layers.length - 1);
+    render();
+  });
+
+  delLayerBtn.addEventListener('click', () => {
+    if (!keymap || keymap.layers.length <= 1) return;
+    const idx = currentLayerIdx();
+    keymap.layers.splice(idx, 1);
+    rebuildLayerSelect();
+    layerSelect.value = String(Math.max(0, idx - 1));
+    render();
+  });
+
+  scaleSelect.addEventListener('change', render);
+
+  setKCBtn.addEventListener('click', () => {
+    if (selectedIndex < 0) return;
+    const value = (kcInput.value || "").trim() || "KC_TRNS";
+    const layerIdx = currentLayerIdx();
+    keymap.layers[layerIdx][selectedIndex] = value;
+    render();
+  });
+
+  clearKCBtn.addEventListener('click', () => {
+    if (selectedIndex < 0) return;
+    const layerIdx = currentLayerIdx();
+    keymap.layers[layerIdx][selectedIndex] = "KC_TRNS";
+    kcInput.value = "KC_TRNS";
+    render();
+  });
+
+  exportBtn.addEventListener('click', () => {
+    if (!keymap) return;
+    const blob = new Blob([JSON.stringify(keymap, null, 2)], { type: "application/json" });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = "keymap.json";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  });
+
+  copyBtn.addEventListener('click', async () => {
+    if (!keymap) return;
+    await navigator.clipboard.writeText(JSON.stringify(keymap, null, 2));
+    copyBtn.textContent = "Copié ✅";
+    setTimeout(() => (copyBtn.textContent = "Copier JSON"), 1200);
+  });
+})();
+</script>
+</body>
+</html>
