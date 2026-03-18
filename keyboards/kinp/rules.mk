@@ -1,2 +1,3 @@
-# Build Options
+#Build Options
+SRC += myfunctions.c
 
